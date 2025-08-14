@@ -27,5 +27,7 @@ export const KNOWN_ENDPOINTS = [
   { method: 'POST', path: '/v1/chat/completions' },
   { method: 'GET', path: '/v1/models' },
   { method: 'POST', path: '/v1/completions' },
-  { method: 'POST', path: '/v1/embeddings' }
+  { method: 'POST', path: '/v1/embeddings' },
+  { method: 'POST', path: '/api/chat' },
+  { method: 'GET', path: '/api/tags' }
 ];

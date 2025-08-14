@@ -2,6 +2,7 @@ import { serve } from 'bun';
 import { loadEnvFile, PORT, OLLAMA_API_KEY, KNOWN_ENDPOINTS } from './config';
 import { handleChatCompletions } from './chat';
 import { handleModels } from './models';
+import { handleModels1 } from './models1';
 import { createErrorResponse } from './errors';
 
 loadEnvFile();
@@ -33,8 +34,16 @@ const server = serve({
       return handleChatCompletions(req);
     }
 
+    if (url.pathname === '/api/chat' && req.method === 'POST') {
+      return handleChatCompletions(req);
+    }  
+
     if (url.pathname === '/v1/models' && req.method === 'GET') {
       return handleModels(req);
+    }
+
+    if (url.pathname === '/api/tags' && req.method === 'GET') {
+      return handleModels1(req);
     }
 
     if (url.pathname === '/v1/completions' && req.method === 'POST') {
