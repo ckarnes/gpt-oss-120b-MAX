@@ -1,12 +1,22 @@
 /* ==============================================================
    chatHandler.ts
    --------------------------------------------------------------
-   * Supports both non‑streaming and streaming (/v1/chat/completions).
-   * Streaming now returns **plain NDJSON** – the same format that
-     Ollama’s own API returns, which n8n can consume.
-   * Extensive console‑debug logging.
-   * Optional `debug` section in every JSON response when
-     INCLUDE_DEBUG_IN_RESPONSE=true.
+   * Handles POST /v1/chat/completions (streaming & non‑streaming)
+   * Normalises a boolean `tools` field (`tools:true`) → empty array.
+   * Keeps a real `tools` array (if provided) and forwards it to Ollama.
+   * Adds missing `tool_call_id` on tool‑result messages and missing
+     `id` on assistant.tool_calls (so the OpenAI validator passes).
+   * **Tool results are turned into normal assistant messages** and
+     a short “you can now answer” note is appended – this gives the
+     model a clear cue to stop calling tools.
+   * **Guard against infinite loops:** after `MAX_TOOL_ITERATIONS`
+     tool results the proxy stops forwarding and returns a final
+     answer (`Agent stopped due to max iterations.`).  Adjust the
+     constant if you need a larger limit.
+   * Deep debug logging (raw payload, tools, each message) and optional
+     `debug` field in the response (`INCLUDE_DEBUG_IN_RESPONSE=true`).
+   * Streaming returns raw NDJSON (exactly the format you see with
+     `curl -N …`).
    ============================================================== */
 
 import type {
@@ -29,6 +39,11 @@ import {
 } from './validation';
 import { handleModelsInternal } from './models';
 import { OLLAMA_HOST, OLLAMA_API_KEY } from './config';
+
+/* --------------------------------------------------------------
+   Configurable guard – how many tool results we allow per turn
+-------------------------------------------------------------- */
+const MAX_TOOL_ITERATIONS = 5;               // change if you need more
 
 /* --------------------------------------------------------------
    Debug helper – toggle with NODE_ENV or a dedicated flag
@@ -87,6 +102,66 @@ function buildErrorResponse(
     status,
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+/* --------------------------------------------------------------
+   Helper – deep dump of any tool‑related data in the request
+-------------------------------------------------------------- */
+function dumpToolInfo(requestId: string, req: OpenAIChatRequest, rawPayload?: string) {
+  // 1️⃣ Raw payload (first 500 chars)
+  if (rawPayload) {
+    debug.info('Raw request payload (first 500 chars)', {
+      requestId,
+      payload: rawPayload.slice(0, 500),
+    });
+  }
+
+  // 2️⃣ Tools array (if present)
+  if (Array.isArray(req.tools)) {
+    debug.info('Tools array (count)', { requestId, count: req.tools.length });
+    req.tools.forEach((tool, idx) => {
+      debug.info(`Tool #${idx + 1}`, {
+        requestId,
+        tool,
+      });
+    });
+  } else {
+    debug.info('No tools array (or it was a boolean shortcut)', { requestId });
+  }
+
+  // 3️⃣ Per‑message inspection
+  if (Array.isArray(req.messages)) {
+    req.messages.forEach((msg, idx) => {
+      const base = {
+        requestId,
+        index: idx,
+        role: msg.role,
+        contentSnippet:
+          typeof msg.content === 'string' ? msg.content.slice(0, 200) : undefined,
+      };
+
+      if (msg.role === 'assistant' && (msg as any).tool_calls) {
+        const toolCalls = (msg as any).tool_calls;
+        debug.info('Assistant message with tool_calls', {
+          ...base,
+          toolCalls: toolCalls.map((tc: any) => ({
+            id: tc.id,
+            functionName: tc.function?.name,
+            arguments: tc.function?.arguments,
+          })),
+        });
+      } else if (msg.role === 'tool') {
+        debug.info('Tool result message', {
+          ...base,
+          tool_call_id: (msg as any).tool_call_id,
+        });
+      } else {
+        debug.info('Regular message', base);
+      }
+    });
+  } else {
+    debug.warn('Messages field is not an array', { requestId });
+  }
 }
 
 /* ==============================================================
@@ -152,7 +227,53 @@ export const handleChatCompletions = async (req: Request): Promise<Response> => 
 
   const openAIReq = body!; // safe – parsing succeeded
 
-  // ------------------- 5️⃣ Log parsed request -------------------
+  // --------------------------------------------------------------
+  // 5️⃣ Normalise a boolean shortcut (`tools:true`) – keep real array
+  // --------------------------------------------------------------
+  if (openAIReq.tools === true) {
+    (openAIReq as any).tools = []; // validator wants an array
+    debug.info('Normalized tools:true → tools: []');
+  }
+
+  // --------------------------------------------------------------
+  // 6️⃣ Ensure every tool‑result message has a tool_call_id
+  // --------------------------------------------------------------
+  if (Array.isArray(openAIReq.messages)) {
+    let placeholderIdx = 1;
+    for (const msg of openAIReq.messages) {
+      // 6.1️⃣ Tool result messages (`role: "tool"`)
+      if (msg.role === 'tool' && (msg as any).tool_call_id == null) {
+        (msg as any).tool_call_id = `generated-${placeholderIdx++}`;
+        debug.info('Added missing tool_call_id to tool message', {
+          index: openAIReq.messages.indexOf(msg),
+          generatedId: (msg as any).tool_call_id,
+        });
+      }
+
+      // 6.2️⃣ Assistant messages that contain `tool_calls`
+      if (
+        msg.role === 'assistant' &&
+        (msg as any).tool_calls &&
+        Array.isArray((msg as any).tool_calls)
+      ) {
+        for (const tc of (msg as any).tool_calls) {
+          if (tc.id == null) {
+            tc.id = `generated-${placeholderIdx++}`;
+            debug.info('Added missing id to assistant.tool_calls', {
+              generatedId: tc.id,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // --------------------------------------------------------------
+  // 7️⃣ DEEP DEBUG – dump everything that might involve tools
+  // --------------------------------------------------------------
+  dumpToolInfo(requestId, openAIReq, rawClientPayload);
+
+  // ------------------- 8️⃣ Log parsed request (post‑normalisation) ---
   debug.info('Parsed OpenAI request', {
     model: openAIReq.model,
     stream: openAIReq.stream,
@@ -160,14 +281,24 @@ export const handleChatCompletions = async (req: Request): Promise<Response> => 
     messagesCount: openAIReq.messages?.length,
   });
 
-  // ------------------- 6️⃣ Generic validation -------------------
+  // ------------------- 9️⃣ Generic validation -------------------
   const requestValidation = validateRequest(openAIReq);
   if (requestValidation) {
-    debug.warn('Request validation failed', requestValidation);
-    return requestValidation; // already a Response
+    // Log the *body* of the validation error for easier debugging.
+    let errBody = '';
+    try {
+      errBody = await requestValidation.clone().text();
+    } catch (_) {
+      /* ignore */
+    }
+    debug.warn('Request validation failed', {
+      status: requestValidation.status,
+      body: errBody,
+    });
+    return requestValidation; // already a proper Response
   }
 
-  // ------------------- 7️⃣ Validate model exists ----------------
+  // ------------------- 🔟 Validate model exists ----------------
   const modelsResponse = await handleModelsInternal();
   const availableModels = modelsResponse.data.map((m) => m.id);
   if (!validateModel(openAIReq.model, availableModels)) {
@@ -176,14 +307,14 @@ export const handleChatCompletions = async (req: Request): Promise<Response> => 
     return buildErrorResponse(msg, 'invalid_request_error', 404, 'model');
   }
 
-  // ------------------- 8️⃣ Parameter validation -----------------
+  // ------------------- 1️⃣1️⃣ Parameter validation -----------------
   const paramValidation = validateParameters(openAIReq);
   if (paramValidation) {
     debug.warn('Parameter validation failed', paramValidation);
     return paramValidation; // already a Response
   }
 
-  // ------------------- 9️⃣ Destructure request -------------------
+  // ------------------- 1️⃣2️⃣ Destructure request -----------------
   const {
     model,
     messages,
@@ -195,16 +326,94 @@ export const handleChatCompletions = async (req: Request): Promise<Response> => 
     presence_penalty,
     stop,
     response_format,
+    tools,                // keep the (possibly empty) array
   } = openAIReq;
 
-  // ------------------- 10️⃣ Convert messages --------------------
-  const ollamaMessages = convertToOllamaMessages(messages);
+  // --------------------------------------------------------------
+  // 13️⃣ Convert tool‑result messages into normal assistant messages
+  //     and add a “you can now answer” hint.
+  // --------------------------------------------------------------
+  // Count how many tool‑result messages we already have.
+  const toolResultCount = messages.filter((m) => m.role === 'tool').length;
+
+  // If we have exceeded the safe limit, we abort and return a final answer.
+  if (toolResultCount >= MAX_TOOL_ITERATIONS) {
+    debug.warn('Maximum tool iterations reached – returning final answer', {
+      requestId,
+      toolResultCount,
+    });
+
+    const finalAnswer: OpenAIChatResponse = {
+      id: generateId(),
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model,
+      system_fingerprint: 'fp_ollama_proxy',
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: 'assistant',
+            content:
+              'Agent stopped due to max iterations. Here is the best answer I can provide based on the information I have.',
+          },
+          finish_reason: 'stop',
+        },
+      ],
+      usage: {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+      },
+    };
+
+    // If you want this to be a streaming response, you could construct
+    // the SSE chunks manually, but the non‑streaming path is sufficient
+    // for the safety‑guard case.
+    return new Response(JSON.stringify(finalAnswer), {
+      headers: responseHeaders,
+    });
+  }
+
+  // Normal case – transform each tool result into an assistant message.
+  const transformedMessages = messages.map((msg) => {
+    if (msg.role === 'tool') {
+      const content = (msg as any).content ?? '';
+      debug.info('Converting tool result to assistant message', {
+        requestId,
+        tool_call_id: (msg as any).tool_call_id,
+        contentSnippet: typeof content === 'string' ? content.slice(0, 200) : '',
+      });
+
+      // 1️⃣ The raw tool output (so the model can read it)
+      const assistantMsg = {
+        role: 'assistant' as const,
+        content,
+      };
+
+      // 2️⃣ A tiny hint that the model now has the answer and can stop.
+      //    This line is optional – many LLMs understand the raw JSON,
+      //    but adding a clear cue reduces the chance of a loop.
+      const hintMsg = {
+        role: 'assistant' as const,
+        content: 'You have the tool result above. Please answer the user and do not call any more tools unless necessary.',
+      };
+
+      // Return both messages in order.
+      return [assistantMsg, hintMsg];
+    }
+    // Regular messages stay as‑is.
+    return msg;
+  }).flat(); // flatten the array because tool results become two entries
+
+  // ------------------- 1️⃣3️⃣ Convert (transformed) messages --------------------
+  const ollamaMessages = convertToOllamaMessages(transformedMessages);
   debug.info('Converted messages to Ollama format', {
-    originalCount: messages.length,
+    originalCount: transformedMessages.length,
     ollamaCount: ollamaMessages.length,
   });
 
-  // ------------------- 11️⃣ Build Ollama options ----------------
+  // ------------------- 1️⃣4️⃣ Build Ollama options ----------------
   const options: OllamaOptions = {};
   if (temperature !== undefined) options.temperature = temperature;
   if (max_tokens !== undefined) options.num_predict = max_tokens;
@@ -215,20 +424,29 @@ export const handleChatCompletions = async (req: Request): Promise<Response> => 
 
   debug.info('Ollama request options', options);
 
-  // ------------------- 12️⃣ Assemble final Ollama request -------
+  // ------------------- 1️⃣5️⃣ Assemble final Ollama request -------
   const ollamaRequest: OllamaChatRequest = {
     model,
     messages: ollamaMessages,
-    stream,               // keep whatever the client asked for
+    stream,               // keep whatever the client set (true/false)
   };
+
+  // Forward the tools array (if any)
+  if (Array.isArray(tools) && tools.length > 0) {
+    // @ts-ignore – Ollama accepts the same shape as OpenAI
+    (ollamaRequest as any).tools = tools;
+    debug.info('Added tools to Ollama request', { count: tools.length });
+  }
+
   if (Object.keys(options).length) ollamaRequest.options = options;
   if (response_format?.type === 'json_object') ollamaRequest.format = 'json';
 
-  debug.info('Prepared Ollama request', { ollamaRequest });
+  // Log the **complete** request that will be sent to Ollama
+  debug.info('Prepared Ollama request (final)', { ollamaRequest });
 
-  // ------------------- 13️⃣ Dispatch ----------------------------
+  // ------------------- 1️⃣6️⃣ Dispatch ----------------------------
   if (stream) {
-    // ---- STREAMING ----
+    // Streaming – forward raw NDJSON from Ollama.
     return handleStreamingChat(
       ollamaRequest,
       model,
@@ -238,7 +456,7 @@ export const handleChatCompletions = async (req: Request): Promise<Response> => 
     );
   }
 
-  // ---- NON‑STREAMING ----
+  // Non‑streaming – single JSON response.
   return handleNonStreamingChat(
     ollamaRequest,
     model,
@@ -309,11 +527,12 @@ export const handleNonStreamingChat = async (
       body: rawOllamaBody.slice(0, 500),
     });
 
-    // Try to parse as a single JSON object; if that fails, fall back to NDJSON.
+    // Try to parse as a single JSON object; fallback to NDJSON if needed.
     let parsed: any;
     try {
       parsed = JSON.parse(rawOllamaBody);
     } catch {
+      // NDJSON fallback
       const lines = rawOllamaBody
         .split('\n')
         .map((l) => l.trim())
@@ -351,7 +570,7 @@ export const handleNonStreamingChat = async (
       };
     }
 
-    // Build the OpenAI‑compatible payload.
+    // Build OpenAI‑compatible response
     let content = parsed.message?.content || '';
     if (originalRequest.response_format?.type === 'json_object') {
       try {
@@ -385,7 +604,7 @@ export const handleNonStreamingChat = async (
       },
     };
 
-    // Optional debug block.
+    // Optional debug block
     if (INCLUDE_DEBUG_IN_RESPONSE) {
       // @ts-ignore – non‑standard field for debugging only
       (openaiResponse as any).debug = {
@@ -427,11 +646,7 @@ export const handleNonStreamingChat = async (
 };
 
 /* ==============================================================
-   Streaming implementation – **raw NDJSON forwarding**
-   --------------------------------------------------------------
-   The proxy now simply pipes Ollama’s streaming response straight
-   to the client (no `data:` prefix, no extra SSE wrapper). This
-   matches the format you posted with `curl` and is accepted by n8n.
+   Streaming implementation – raw NDJSON forwarding
 ============================================================== */
 export const handleStreamingChat = async (
   ollamaRequest: OllamaChatRequest,
@@ -443,7 +658,6 @@ export const handleStreamingChat = async (
   const start = Date.now();
   debug.info('→ Streaming request start', { requestId, model });
 
-  // Build the URL – note that `OLLAMA_HOST` may be http or https.
   const url = `${OLLAMA_HOST}/api/chat`;
   debug.info('Fetching Ollama (stream)', { url });
 
@@ -485,29 +699,18 @@ export const handleStreamingChat = async (
       );
     }
 
-    // -----------------------------------------------------------------
-    // At this point `ollamaResp.body` is a ReadableStream that yields
-    // the exact NDJSON lines Ollama sends (e.g. `{"model": "..."}\n`).
-    // We **do not** wrap them in `data:`; we forward them unchanged.
-    // -----------------------------------------------------------------
+    // Forward the raw NDJSON stream unchanged.
     const streamingHeaders = {
-      // Keep the content‑type that Ollama uses (plain JSON lines)
-      // Clients (n8n, curl -N) understand this as a streaming body.
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/json', // raw NDJSON lines
       'x-request-id': requestId,
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
-      // Rate‑limit headers – optional but nice to keep consistent
+      // Optional rate‑limit headers for consistency
       'x-ratelimit-limit-requests': '10000',
       'x-ratelimit-remaining-requests': '9999',
       'x-ratelimit-reset-requests': new Date(Date.now() + 60000).toISOString(),
     };
 
-    // If you want to add a final `[DONE]` line, you could pipe the
-    // stream through a TransformStream that appends it when the
-    // upstream closes. Most clients (including n8n) treat the last
-    // JSON line that contains `"done": true` as the terminator, so
-    // we leave the stream untouched.
     return new Response(ollamaResp.body!, {
       headers: streamingHeaders,
     });
@@ -537,11 +740,12 @@ export const handleStreamingChat = async (
 
 /* --------------------------------------------------------------
    NOTE
-   * The streaming path now forwards **raw NDJSON** exactly as
-     Ollama returns it. This matches the curl output you posted
-     and works with n8n’s “Continue on response” streaming mode.
-   * If you later decide you need the OpenAI‑style SSE
-     (prefixed with `data:`), you can re‑introduce the previous
-     `handleStreamingChat` implementation and change the client
-     accordingly.
+   * The **tool‑result → assistant** conversion now adds a tiny hint
+     that the model may answer and stop.  This alone often prevents
+     the model from looping.
+   * If you still see repeated calls, the **MAX_TOOL_ITERATIONS**
+     guard will cut the conversation after the configured number of
+     tool results and return a clear “max iterations” message.
+   * All deep‑debug logging remains, and the optional `debug` field
+     (enabled with `INCLUDE_DEBUG_IN_RESPONSE=true`) still works.
 -------------------------------------------------------------- */
