@@ -46,6 +46,13 @@ const server = serve({
       return handleModels1(req);
     }
 
+    if (url.pathname === '/api/version' && req.method === 'GET') {
+      return new Response(JSON.stringify({ version: '0.11.4' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }  
+
     if (url.pathname === '/v1/completions' && req.method === 'POST') {
       return createErrorResponse(
         'The Completions API is deprecated. Please use /v1/chat/completions instead.',
